@@ -2,8 +2,55 @@ import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import Stats from "three/addons/libs/stats.module.js";
+// The npm package's main entry only exposes the `init` default; the
+// wasm-bindgen classes live in nucleation-original.js. The package
+// has no `"exports"` field, so the subpath isn't reachable via the
+// bare specifier — fall back to a relative path into node_modules.
+import init from "nucleation";
+import {
+  SchematicWrapper,
+  ResourcePackWrapper,
+  MeshConfigWrapper as MeshConfig,
+} from "../../node_modules/nucleation/nucleation-original.js";
 
 const vscode = acquireVsCodeApi();
+
+// ── Nucleation state ──────────────────────────────────────────────
+// The .wasm path is exposed by extension.ts via the script's
+// data-wasm-base attribute; we use it to point wasm-bindgen's init at
+// the bundled artifact rather than the default `./` lookup which fails
+// inside VSCode's webview origin.
+const wasmBase = (() => {
+  const tag = document.querySelector("script[data-wasm-base]");
+  return tag?.getAttribute("data-wasm-base") ?? "./";
+})();
+let nucleationReady;
+function ensureNucleation() {
+  return (nucleationReady ??= init(wasmBase + "nucleation_bg.wasm"));
+}
+
+let resourcePackUris = [];
+let resourcePackPromise = null;
+function ensureResourcePack(uris) {
+  if (uris.length === 0) return Promise.resolve(null);
+  const key = uris.join("\n");
+  if (resourcePackPromise && resourcePackPromise._key === key)
+    return resourcePackPromise;
+  const promise = (async () => {
+    const buffers = await Promise.all(
+      uris.map(async (u) => {
+        const r = await fetch(u);
+        if (!r.ok) throw new Error("resource pack fetch " + r.status);
+        return new Uint8Array(await r.arrayBuffer());
+      })
+    );
+    if (buffers.length === 1) return new ResourcePackWrapper(buffers[0]);
+    return ResourcePackWrapper.fromBytesList(buffers);
+  })();
+  promise._key = key;
+  resourcePackPromise = promise;
+  return promise;
+}
 
 // ── Config (pushed by extension) ──────────────────────────────────
 let config = {
@@ -172,6 +219,18 @@ addEventListener("message", (event) => {
   if (!msg) return;
   if (msg.type === "config") {
     config = { ...config, ...msg.config };
+    const newUris = Array.isArray(msg.resourcePackUris)
+      ? msg.resourcePackUris
+      : [];
+    const changed =
+      newUris.length !== resourcePackUris.length ||
+      newUris.some((u, i) => u !== resourcePackUris[i]);
+    if (changed) {
+      resourcePackUris = newUris;
+      resourcePackPromise = null;
+      // Reload current scene so the new pack textures take effect.
+      if (currentUri) loadGLB(currentUri);
+    }
     applyBackground(); rebuildGrid(); rebuildAxes(); applyStats();
     setActive("btn-grid", config.gridEnabled);
     setActive("btn-axes", config.axesEnabled);
@@ -391,35 +450,86 @@ async function applyLoadedGLTF(gltf, doFrame) {
   flash("loaded " + new Date().toLocaleTimeString() + animLabel);
 }
 
-function loadGLB(uri) {
+/**
+ * Load a schematic file, run it through Nucleation to get GLB bytes,
+ * then hand those off to the existing GLTF pipeline. Function name
+ * stays `loadGLB` so the rest of the viewer (file-watcher, scene
+ * picker, …) doesn't have to know that the source is now a schematic.
+ */
+async function loadGLB(uri) {
   currentUri = uri;
   const meta = sceneMeta.get(uri);
   currentFsPath = meta?.fsPath ?? null;
-  const cacheBust = uri + (uri.includes("?") ? "&" : "?") + "t=" + Date.now();
   spinner.classList.add("show");
-  loader.load(
-    cacheBust,
-    async (gltf) => {
-      spinner.classList.remove("show");
-      let framed = false;
-      if (resetCameraNext) {
-        await applyLoadedGLTF(gltf, true);
-        resetCameraNext = false;
-        framed = true;
-      } else if (meta?.savedCamera) {
-        await applyLoadedGLTF(gltf, false);
-        framed = restoreCamera(meta.savedCamera);
-        if (!framed) frameCameraOnModel(currentModel);
-      } else {
-        await applyLoadedGLTF(gltf, true);
-      }
-    },
-    undefined,
-    (err) => {
-      spinner.classList.remove("show");
-      status.textContent = "error: " + err.message;
+  status.textContent = "loading…";
+
+  try {
+    const cacheBust =
+      uri + (uri.includes("?") ? "&" : "?") + "t=" + Date.now();
+
+    const [{ }, fileBytes] = await Promise.all([
+      ensureNucleation().then(() => ({})),
+      fetch(cacheBust)
+        .then((r) => {
+          if (!r.ok) throw new Error("schematic fetch " + r.status);
+          return r.arrayBuffer();
+        })
+        .then((ab) => new Uint8Array(ab)),
+    ]);
+
+    if (uri !== currentUri) return; // user moved on while we were fetching
+
+    if (resourcePackUris.length === 0) {
+      throw new Error(
+        "No resource pack configured. Set 'liveSchematic.resourcePack' to a vanilla client jar or a resource pack zip."
+      );
     }
-  );
+    const pack = await ensureResourcePack(resourcePackUris);
+
+    if (uri !== currentUri) return;
+
+    const schem = new SchematicWrapper();
+    const fsPath = (meta?.fsPath ?? "").toLowerCase();
+    if (fsPath.endsWith(".litematic")) schem.from_litematic(fileBytes);
+    else if (fsPath.endsWith(".schem")) schem.from_schematic(fileBytes);
+    else if (fsPath.endsWith(".mcstructure")) schem.from_mcstructure(fileBytes);
+    else schem.from_data(fileBytes);
+
+    const meshConfig = new MeshConfig();
+    const mesh = schem.toMesh(pack, meshConfig);
+    const glbBytes = mesh.toGlb();
+
+    const gltf = await new Promise((resolve, reject) => {
+      loader.parse(
+        glbBytes.buffer.slice(
+          glbBytes.byteOffset,
+          glbBytes.byteOffset + glbBytes.byteLength
+        ),
+        "",
+        resolve,
+        reject
+      );
+    });
+
+    if (uri !== currentUri) return;
+    spinner.classList.remove("show");
+
+    if (resetCameraNext) {
+      await applyLoadedGLTF(gltf, true);
+      resetCameraNext = false;
+    } else if (meta?.savedCamera) {
+      await applyLoadedGLTF(gltf, false);
+      const framed = restoreCamera(meta.savedCamera);
+      if (!framed) frameCameraOnModel(currentModel);
+    } else {
+      await applyLoadedGLTF(gltf, true);
+    }
+  } catch (err) {
+    spinner.classList.remove("show");
+    const message = err?.message ?? String(err);
+    status.textContent = "error: " + message;
+    vscode.postMessage({ type: "errorReport", message });
+  }
 }
 
 // ── Render loop ───────────────────────────────────────────────────

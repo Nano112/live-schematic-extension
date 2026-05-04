@@ -18,9 +18,9 @@ jobs:
       - run: npm run typecheck
       - run: npm run build
       - name: Package (smoke test)
-        run: npx @vscode/vsce package --out live-glb-extension-ci.vsix
+        run: npx @vscode/vsce package --out live-schematic-extension-ci.vsix
       - uses: actions/upload-artifact@v4
         with:
           name: vsix
-          path: live-glb-extension-ci.vsix
+          path: live-schematic-extension-ci.vsix
           if-no-files-found: error

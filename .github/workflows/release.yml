@@ -37,12 +37,12 @@ jobs:
         run: npm run build
 
       - name: Package VSIX
-        run: npx @vscode/vsce package --out "live-glb-extension-${GITHUB_REF_NAME}.vsix"
+        run: npx @vscode/vsce package --out "live-schematic-extension-${GITHUB_REF_NAME}.vsix"
 
       - name: Attach VSIX to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: live-glb-extension-*.vsix
+          files: live-schematic-extension-*.vsix
           generate_release_notes: true
 
       - name: Publish to VSCode Marketplace (if VSCE_PAT secret set)
@@ -50,7 +50,7 @@ jobs:
           VSCE_PAT: ${{ secrets.VSCE_PAT }}
         run: |
           if [ -n "$VSCE_PAT" ]; then
-            npx @vscode/vsce publish --packagePath live-glb-extension-*.vsix
+            npx @vscode/vsce publish --packagePath live-schematic-extension-*.vsix
           else
             echo "VSCE_PAT not set — skipping Marketplace publish"
           fi
@@ -60,7 +60,7 @@ jobs:
           OVSX_PAT: ${{ secrets.OVSX_PAT }}
         run: |
           if [ -n "$OVSX_PAT" ]; then
-            npx ovsx publish live-glb-extension-*.vsix -p "$OVSX_PAT"
+            npx ovsx publish live-schematic-extension-*.vsix -p "$OVSX_PAT"
           else
             echo "OVSX_PAT not set — skipping Open VSX publish"
           fi

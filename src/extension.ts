@@ -2,28 +2,45 @@ import * as vscode from "vscode";
 import * as path from "path";
 import * as crypto from "crypto";
 
-const CAM_PREFIX = "liveGlb.cam:";
+const CAM_PREFIX = "liveSchematic.cam:";
+const SCHEMATIC_GLOBS = "**/*.{schem,litematic,nbt,mcstructure}";
 
 export function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(
-    vscode.commands.registerCommand("liveGlb.open", () => openWorkspaceViewer(context)),
+    vscode.commands.registerCommand("liveSchematic.open", () =>
+      openWorkspaceViewer(context)
+    ),
+    vscode.commands.registerCommand("liveSchematic.setResourcePack", () =>
+      pickAndSaveResourcePack()
+    ),
+    vscode.commands.registerCommand("liveSchematic.openSettings", () =>
+      vscode.commands.executeCommand(
+        "workbench.action.openSettings",
+        "@ext:Nano112.live-schematic-extension"
+      )
+    ),
     vscode.window.registerCustomEditorProvider(
-      "liveGlb.viewer",
-      new GlbEditorProvider(context),
-      { webviewOptions: { retainContextWhenHidden: true }, supportsMultipleEditorsPerDocument: false }
+      "liveSchematic.viewer",
+      new SchematicEditorProvider(context),
+      {
+        webviewOptions: { retainContextWhenHidden: true },
+        supportsMultipleEditorsPerDocument: false,
+      }
     )
   );
 }
 
 export function deactivate() {}
 
-// ── Shared helpers ────────────────────────────────────────────────
+// ── Config ────────────────────────────────────────────────────────
 function getConfig() {
-  const c = vscode.workspace.getConfiguration("liveGlb");
+  const c = vscode.workspace.getConfiguration("liveSchematic");
   return {
+    resourcePack: c.get<string>("resourcePack", ""),
+    extraResourcePacks: c.get<string[]>("extraResourcePacks", []),
     backgroundColor: c.get<string>("backgroundColor", ""),
     gridEnabled: c.get<boolean>("gridEnabled", true),
-    gridSize: c.get<number>("gridSize", 20),
+    gridSize: c.get<number>("gridSize", 32),
     axesEnabled: c.get<boolean>("axesEnabled", false),
     statsEnabled: c.get<boolean>("statsEnabled", false),
     tickMs: c.get<number>("tickMs", 50),
@@ -36,12 +53,73 @@ function camKey(fsPath: string) {
   return CAM_PREFIX + fsPath;
 }
 
-async function writeScreenshot(glbFsPath: string, dataUrl: string): Promise<string> {
+/**
+ * Prompt the user to pick a Minecraft client jar / resource pack zip
+ * and persist the chosen path to the user's `liveSchematic.resourcePack`
+ * setting. Triggered from the Command Palette so the resource pack is
+ * configurable without diving into JSON or the Settings UI.
+ */
+async function pickAndSaveResourcePack() {
+  const current = vscode.workspace
+    .getConfiguration("liveSchematic")
+    .get<string>("resourcePack", "");
+
+  const picked = await vscode.window.showOpenDialog({
+    canSelectFiles: true,
+    canSelectFolders: false,
+    canSelectMany: false,
+    openLabel: "Use as resource pack",
+    title: "Pick a Minecraft resource pack (.jar or .zip)",
+    defaultUri: current ? vscode.Uri.file(current) : undefined,
+    filters: { "Resource pack": ["jar", "zip"] },
+  });
+  if (!picked || picked.length === 0) return;
+
+  const fsPath = picked[0].fsPath;
+  await vscode.workspace
+    .getConfiguration("liveSchematic")
+    .update("resourcePack", fsPath, vscode.ConfigurationTarget.Global);
+  vscode.window.showInformationMessage(
+    `Live Schematic: resource pack set to ${path.basename(fsPath)}`
+  );
+}
+
+/**
+ * Resolve the resource pack paths into webview-fetchable URIs. Empty
+ * strings and missing files are dropped silently — the webview falls
+ * back to an untextured / placeholder render in that case.
+ */
+function resourcePackUris(
+  webview: vscode.Webview
+): { paths: string[]; uris: string[] } {
+  const cfg = getConfig();
+  const all = [cfg.resourcePack, ...cfg.extraResourcePacks].filter(
+    (p): p is string => typeof p === "string" && p.length > 0
+  );
+  const paths: string[] = [];
+  const uris: string[] = [];
+  for (const p of all) {
+    try {
+      const uri = vscode.Uri.file(p);
+      uris.push(webview.asWebviewUri(uri).toString());
+      paths.push(p);
+    } catch {
+      // Ignore malformed paths; webview will get the rest.
+    }
+  }
+  return { paths, uris };
+}
+
+async function writeScreenshot(
+  schemFsPath: string,
+  dataUrl: string
+): Promise<string> {
   const m = /^data:image\/png;base64,(.+)$/.exec(dataUrl);
   if (!m) throw new Error("invalid screenshot payload");
   const bytes = Buffer.from(m[1], "base64");
-  const dir = path.dirname(glbFsPath);
-  const base = path.basename(glbFsPath, ".glb");
+  const dir = path.dirname(schemFsPath);
+  const ext = path.extname(schemFsPath);
+  const base = path.basename(schemFsPath, ext);
   const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
   const out = path.join(dir, `${base}.${stamp}.png`);
   await vscode.workspace.fs.writeFile(vscode.Uri.file(out), bytes);
@@ -52,7 +130,9 @@ function setupPanel(
   context: vscode.ExtensionContext,
   panel: vscode.WebviewPanel,
   opts: {
-    initialScenes: () => Promise<{ name: string; uri: string; fsPath: string; savedCamera?: any }[]>;
+    initialScenes: () => Promise<
+      { name: string; uri: string; fsPath: string; savedCamera?: any }[]
+    >;
     activeUri?: () => string | undefined;
     watcher: vscode.FileSystemWatcher;
     onWatcherChange?: (changedUri: vscode.Uri) => void;
@@ -60,7 +140,16 @@ function setupPanel(
 ) {
   panel.webview.html = renderHtml(panel.webview, context.extensionUri);
 
-  const sendConfig = () => panel.webview.postMessage({ type: "config", config: getConfig() });
+  const sendConfig = () => {
+    const cfg = getConfig();
+    const { uris: packUris, paths: packPaths } = resourcePackUris(panel.webview);
+    panel.webview.postMessage({
+      type: "config",
+      config: cfg,
+      resourcePackUris: packUris,
+      resourcePackPaths: packPaths,
+    });
+  };
   const sendScenes = async () =>
     panel.webview.postMessage({
       type: "scenes",
@@ -69,7 +158,7 @@ function setupPanel(
     });
 
   const cfgListener = vscode.workspace.onDidChangeConfiguration((e) => {
-    if (e.affectsConfiguration("liveGlb")) sendConfig();
+    if (e.affectsConfiguration("liveSchematic")) sendConfig();
   });
 
   const themeListener = vscode.window.onDidChangeActiveColorTheme(() =>
@@ -105,24 +194,42 @@ function setupPanel(
             ...(await opts.initialScenes()),
             {
               name,
-              uri: panel.webview.asWebviewUri(vscode.Uri.file(fsPath)).toString(),
+              uri: panel.webview
+                .asWebviewUri(vscode.Uri.file(fsPath))
+                .toString(),
               fsPath,
               savedCamera: context.workspaceState.get(camKey(fsPath)),
             },
           ],
-          active: panel.webview.asWebviewUri(vscode.Uri.file(fsPath)).toString(),
+          active: panel.webview
+            .asWebviewUri(vscode.Uri.file(fsPath))
+            .toString(),
         });
       } catch (e: any) {
-        vscode.window.showErrorMessage(`Could not open dropped file: ${e.message}`);
+        vscode.window.showErrorMessage(
+          `Could not open dropped file: ${e.message}`
+        );
       }
     } else if (msg.type === "screenshot" && typeof msg.fsPath === "string") {
       try {
         const out = await writeScreenshot(msg.fsPath, msg.dataUrl);
-        panel.webview.postMessage({ type: "screenshotResult", success: true, path: path.basename(out) });
-        vscode.window.showInformationMessage(`Saved screenshot: ${path.basename(out)}`);
+        panel.webview.postMessage({
+          type: "screenshotResult",
+          success: true,
+          path: path.basename(out),
+        });
+        vscode.window.showInformationMessage(
+          `Saved screenshot: ${path.basename(out)}`
+        );
       } catch (e: any) {
-        panel.webview.postMessage({ type: "screenshotResult", success: false, error: e.message });
+        panel.webview.postMessage({
+          type: "screenshotResult",
+          success: false,
+          error: e.message,
+        });
       }
+    } else if (msg.type === "errorReport" && typeof msg.message === "string") {
+      vscode.window.showErrorMessage(`Live Schematic: ${msg.message}`);
     }
   });
 
@@ -134,24 +241,23 @@ function setupPanel(
 }
 
 // ── Custom editor (single file) ───────────────────────────────────
-class GlbEditorProvider implements vscode.CustomReadonlyEditorProvider {
+class SchematicEditorProvider implements vscode.CustomReadonlyEditorProvider {
   constructor(private readonly context: vscode.ExtensionContext) {}
 
   openCustomDocument(uri: vscode.Uri): vscode.CustomDocument {
     return { uri, dispose() {} };
   }
 
-  async resolveCustomEditor(document: vscode.CustomDocument, panel: vscode.WebviewPanel) {
+  async resolveCustomEditor(
+    document: vscode.CustomDocument,
+    panel: vscode.WebviewPanel
+  ) {
     const fileUri = document.uri;
     const folderUri = vscode.Uri.file(path.dirname(fileUri.fsPath));
 
     panel.webview.options = {
       enableScripts: true,
-      localResourceRoots: [
-        vscode.Uri.joinPath(this.context.extensionUri, "out"),
-        vscode.Uri.joinPath(this.context.extensionUri, "media"),
-        folderUri,
-      ],
+      localResourceRoots: localRoots(this.context, folderUri),
     };
 
     const watcher = vscode.workspace.createFileSystemWatcher(
@@ -182,27 +288,25 @@ function openWorkspaceViewer(context: vscode.ExtensionContext) {
   }
 
   const panel = vscode.window.createWebviewPanel(
-    "liveGlb.workspaceViewer",
-    "Live GLB Viewer",
+    "liveSchematic.workspaceViewer",
+    "Live Schematic Viewer",
     vscode.ViewColumn.Beside,
     {
       enableScripts: true,
       retainContextWhenHidden: true,
-      localResourceRoots: [
-        vscode.Uri.joinPath(context.extensionUri, "out"),
-        vscode.Uri.joinPath(context.extensionUri, "media"),
-        ...folders.map((f) => f.uri),
-      ],
+      localResourceRoots: localRoots(context, ...folders.map((f) => f.uri)),
     }
   );
 
-  const watcher = vscode.workspace.createFileSystemWatcher("**/*.glb");
+  const watcher = vscode.workspace.createFileSystemWatcher(SCHEMATIC_GLOBS);
 
   setupPanel(context, panel, {
     initialScenes: async () => {
       const cfg = getConfig();
-      const exclude = cfg.excludeGlobs.length ? `{${cfg.excludeGlobs.join(",")}}` : undefined;
-      const found = await vscode.workspace.findFiles("**/*.glb", exclude);
+      const exclude = cfg.excludeGlobs.length
+        ? `{${cfg.excludeGlobs.join(",")}}`
+        : undefined;
+      const found = await vscode.workspace.findFiles(SCHEMATIC_GLOBS, exclude);
       return found
         .map((uri) => ({
           name: vscode.workspace.asRelativePath(uri),
@@ -216,15 +320,47 @@ function openWorkspaceViewer(context: vscode.ExtensionContext) {
   });
 }
 
+/**
+ * Webview's local-resource roots: the extension's own out/ and media/
+ * dirs, plus any folders the webview needs to fetch user content from
+ * (the schematic file's folder, and the directories of any configured
+ * resource packs — which often live outside the workspace, e.g. in the
+ * user's Minecraft installation).
+ */
+function localRoots(
+  context: vscode.ExtensionContext,
+  ...userFolders: vscode.Uri[]
+): vscode.Uri[] {
+  const cfg = getConfig();
+  const packDirs = [cfg.resourcePack, ...cfg.extraResourcePacks]
+    .filter((p): p is string => typeof p === "string" && p.length > 0)
+    .map((p) => vscode.Uri.file(path.dirname(p)));
+  return [
+    vscode.Uri.joinPath(context.extensionUri, "out"),
+    vscode.Uri.joinPath(context.extensionUri, "media"),
+    ...userFolders,
+    ...packDirs,
+  ];
+}
+
 // ── Webview HTML shell ────────────────────────────────────────────
 function renderHtml(webview: vscode.Webview, extensionUri: vscode.Uri): string {
   const nonce = crypto.randomBytes(16).toString("hex");
-  const webviewJs = webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, "out", "webview.js"));
+  const webviewJs = webview.asWebviewUri(
+    vscode.Uri.joinPath(extensionUri, "out", "webview.js")
+  );
+  const wasmDir = webview.asWebviewUri(
+    vscode.Uri.joinPath(extensionUri, "out", "wasm")
+  );
+
+  // The Nucleation .wasm is fetched at runtime (script-src needs
+  // 'wasm-unsafe-eval'). The webview also fetches arbitrary blob:/data:
+  // URLs for textures and reads schematic file bytes via fetch().
   const csp = [
     `default-src 'none'`,
     `img-src ${webview.cspSource} data: blob:`,
     `style-src ${webview.cspSource} 'unsafe-inline'`,
-    `script-src 'nonce-${nonce}'`,
+    `script-src 'nonce-${nonce}' 'wasm-unsafe-eval' ${webview.cspSource}`,
     `connect-src ${webview.cspSource} blob: data:`,
     `worker-src blob:`,
   ].join("; ");
@@ -234,7 +370,7 @@ function renderHtml(webview: vscode.Webview, extensionUri: vscode.Uri): string {
 <head>
 <meta charset="utf-8">
 <meta http-equiv="Content-Security-Policy" content="${csp}">
-<title>Live GLB Viewer</title>
+<title>Live Schematic Viewer</title>
 <style>
   :root {
     --bg: var(--vscode-editor-background, #1a1a2e);
@@ -301,8 +437,8 @@ function renderHtml(webview: vscode.Webview, extensionUri: vscode.Uri): string {
 </div>
 <div id="spinner"><div></div></div>
 <div id="stats-mount"></div>
-<div id="drop-overlay">drop .glb to load</div>
-<script type="module" nonce="${nonce}" src="${webviewJs}"></script>
+<div id="drop-overlay">drop a schematic to load</div>
+<script type="module" nonce="${nonce}" src="${webviewJs}" data-wasm-base="${wasmDir}/"></script>
 </body>
 </html>`;
 }
